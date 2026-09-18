@@ -205,10 +205,17 @@ def sync_fixture_pose_from_sim(env, fixture):
     point a fixture's python pose back at the simulator's copy of it
 
     see `get_fixture_pose_from_sim` for why the two can disagree
+
+    the body element is written directly rather than through `set_pos` /
+    `set_euler`, because the cabinet and counter subclasses override `set_pos` to
+    re-place their interior object. going through them moves a fixture that was
+    already in the right place, and with it anything derived from that fixture --
+    including the very goal this is called to fix. nothing here should have an
+    effect unless the two poses actually disagree.
     """
     pos, yaw = get_fixture_pose_from_sim(env, fixture)
-    fixture.set_pos(pos)
-    fixture.set_euler(np.array([0.0, 0.0, yaw]))
+    fixture._obj.set("pos", array_to_string(pos))
+    fixture._obj.set("euler", array_to_string(np.array([0.0, 0.0, yaw])))
 
 
 def sync_fixture_poses_from_sim(env, fixtures=None):
