@@ -1,6 +1,7 @@
 import copy
 import unittest
 
+import mujoco
 import numpy as np
 import robosuite
 from robosuite.controllers import load_composite_controller_config
@@ -9,12 +10,16 @@ from termcolor import colored
 
 import robocasa
 from robocasa.models.fixtures import Fixture
+from robocasa.utils import env_utils as EnvUtils
 from robocasa.utils import object_utils as OU
 
 # placements are re-sampled on every reset, so a reconstruction has to be retried
 # a few times before it lands on one that differs from the recorded scene
 MAX_RESAMPLE = 8
 MAX_ATTEMPTS = 6
+# a plain rollout is the same on every reset, so a couple of layouts is enough to
+# cover the cabinets and counters the fixtures are drawn from
+RESETS = 4
 
 
 def make_env(task):
@@ -57,6 +62,24 @@ def restore(env, ep_meta, model_xml, states, search=None):
     env.sim.set_state_from_flattened(states)
     env.sim.forward()
     env.update_state()
+
+
+def is_free_jointed(env, fixture):
+    """
+    Whether the model can move this fixture on its own.
+
+    A body held by a free joint is one that was dropped into the scene rather than
+    placed in it -- a blender lid -- and it settles under gravity before anything
+    reads it back, so its simulated pose genuinely stops matching the pose the
+    model was built with.
+    """
+    body_id = env.sim.model.body_name2id(fixture.root_body)
+    for jnt_id in range(env.sim.model.njnt):
+        if env.sim.model.jnt_bodyid[jnt_id] != body_id:
+            continue
+        if env.sim.model.jnt_type[jnt_id] == mujoco.mjtJoint.mjJNT_FREE:
+            return True
+    return False
 
 
 def base_pose(env):
@@ -129,18 +152,20 @@ class TestStateRestore(unittest.TestCase):
                 # the rest of the test proves nothing: "sync makes them equal" would
                 # hold just as well if the two quantities were different things.
                 #
-                # every fixture without a joint matches to machine precision. the one
-                # that does not is a fixture with a free joint -- a blender lid -- which
-                # settles under gravity once the scene is built, so its recorded
-                # placement and its simulated pose differ by a millimetre. the tolerance
-                # is loose enough for that and far tighter than the offset a mismatched
-                # frame would produce.
+                # every fixture the model places rigidly matches to machine precision.
+                # the ones that do not are bodies a free joint can move: a blender lid
+                # is dropped into the scene and settles under gravity, so by the time
+                # anything reads it back it has moved as far as 22 cm from where the
+                # model put it. that is the simulator having a different scene, not the
+                # two quantities being different things, so those are skipped.
                 for name, fxtr in env.fixtures.items():
                     if not isinstance(fxtr, Fixture):
                         continue
                     try:
                         pos, yaw = OU.get_fixture_pose_from_sim(env, fxtr)
                     except ValueError:
+                        continue
+                    if is_free_jointed(env, fxtr):
                         continue
                     np.testing.assert_allclose(
                         pos,
@@ -196,6 +221,53 @@ class TestStateRestore(unittest.TestCase):
                 return
 
             self.skipTest("no reconstruction drifted far enough to test the sync")
+        finally:
+            env.close()
+
+    def test_sync_is_a_noop_when_the_poses_already_agree(self):
+        """
+        Syncing a scene that is already consistent must leave it alone.
+
+        `HousingCabinet` and `Counter` override `set_pos` to re-place their
+        interior object, so writing a pose back through it moves a fixture that
+        was already in the right place -- and drags along anything derived from
+        that fixture, including the goal `NavigateKitchen` navigates to.  A plain
+        rollout never desyncs python from the simulator, so every call here has
+        to leave every pose, and the goal, exactly where it found them.
+        """
+        env = make_env("NavigateKitchen")
+        try:
+            for attempt in range(RESETS):
+                print(colored(f"NavigateKitchen rollout {attempt}...", "green"))
+                env.unset_ep_meta()
+                env.reset()
+
+                before = {
+                    name: np.array(f.pos)
+                    for name, f in env.fixtures.items()
+                    if isinstance(f, Fixture)
+                }
+                goal = np.array(
+                    EnvUtils.compute_robot_base_placement_pose(env, env.target_fixture)[0]
+                )
+
+                OU.sync_fixture_poses_from_sim(env)
+
+                for name, pos in before.items():
+                    np.testing.assert_allclose(
+                        np.array(env.fixtures[name].pos),
+                        pos,
+                        atol=1e-9,
+                        err_msg=f"{name} was moved by a sync that had nothing to do",
+                    )
+                np.testing.assert_allclose(
+                    np.array(
+                        EnvUtils.compute_robot_base_placement_pose(env, env.target_fixture)[0]
+                    ),
+                    goal,
+                    atol=1e-9,
+                    err_msg="the navigation goal moved by a sync that had nothing to do",
+                )
         finally:
             env.close()
 
@@ -275,24 +347,33 @@ class TestStateRestore(unittest.TestCase):
         try:
             for attempt in range(MAX_ATTEMPTS):
                 print(colored(f"NavigateKitchen reconstruction {attempt}...", "green"))
-                env.unset_ep_meta()
-                env.reset()
 
                 # Whether an episode can show the bug at all is up to its layout. The
                 # goal is derived from a placement, and some placements never move --
                 # an island sink is fixed to the room -- so the goal comes out
                 # identical on every resample and there is nothing to desync. Probe
-                # that first, rather than spending the retries below on a layout that
-                # cannot fail the way the bug describes.
-                ep_meta = env.get_ep_meta()
-                fixture_name = env.target_fixture.name
-                sampled_goal = np.array(env.target_pos)
+                # that first. A layout that cannot show the bug is not a failed
+                # attempt, so draw another one rather than spending one of the few
+                # attempts below on it -- otherwise the test skips on a run of bad
+                # layout draws instead of testing anything.
+                for _ in range(MAX_RESAMPLE):
+                    env.unset_ep_meta()
+                    env.reset()
 
-                env.set_ep_meta(copy.deepcopy(ep_meta))
-                env.reset()
-                if env.target_fixture.name != fixture_name:
-                    continue
-                if np.linalg.norm(np.array(env.target_pos)[:2] - sampled_goal[:2]) < 0.25:
+                    ep_meta = env.get_ep_meta()
+                    fixture_name = env.target_fixture.name
+                    sampled_goal = np.array(env.target_pos)
+
+                    env.set_ep_meta(copy.deepcopy(ep_meta))
+                    env.reset()
+                    if env.target_fixture.name != fixture_name:
+                        continue
+                    if (
+                        np.linalg.norm(np.array(env.target_pos)[:2] - sampled_goal[:2])
+                        >= 0.25
+                    ):
+                        break
+                else:
                     continue
 
                 target = env.target_fixture
