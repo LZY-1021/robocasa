@@ -124,6 +124,32 @@ class TestStateRestore(unittest.TestCase):
                 env.unset_ep_meta()
                 env.reset()
 
+                # while python and simulator still describe the same scene, the
+                # simulator-read pose has to agree with the python one. Without this
+                # the rest of the test proves nothing: "sync makes them equal" would
+                # hold just as well if the two quantities were different things.
+                #
+                # every fixture without a joint matches to machine precision. the one
+                # that does not is a fixture with a free joint -- a blender lid -- which
+                # settles under gravity once the scene is built, so its recorded
+                # placement and its simulated pose differ by a millimetre. the tolerance
+                # is loose enough for that and far tighter than the offset a mismatched
+                # frame would produce.
+                for name, fxtr in env.fixtures.items():
+                    if not isinstance(fxtr, Fixture):
+                        continue
+                    try:
+                        pos, yaw = OU.get_fixture_pose_from_sim(env, fxtr)
+                    except ValueError:
+                        continue
+                    np.testing.assert_allclose(
+                        pos,
+                        np.array(fxtr.pos),
+                        atol=1e-2,
+                        err_msg=f"{name}: the simulator pose is not the fixture pose",
+                    )
+                    self.assertAlmostEqual(fxtr.rot, yaw, places=3)
+
                 ep_meta = env.get_ep_meta()
                 model_xml = env.sim.model.get_xml()
                 states = env.sim.get_state().flatten()
@@ -251,6 +277,24 @@ class TestStateRestore(unittest.TestCase):
                 print(colored(f"NavigateKitchen reconstruction {attempt}...", "green"))
                 env.unset_ep_meta()
                 env.reset()
+
+                # Whether an episode can show the bug at all is up to its layout. The
+                # goal is derived from a placement, and some placements never move --
+                # an island sink is fixed to the room -- so the goal comes out
+                # identical on every resample and there is nothing to desync. Probe
+                # that first, rather than spending the retries below on a layout that
+                # cannot fail the way the bug describes.
+                ep_meta = env.get_ep_meta()
+                fixture_name = env.target_fixture.name
+                sampled_goal = np.array(env.target_pos)
+
+                env.set_ep_meta(copy.deepcopy(ep_meta))
+                env.reset()
+                if env.target_fixture.name != fixture_name:
+                    continue
+                if np.linalg.norm(np.array(env.target_pos)[:2] - sampled_goal[:2]) < 0.25:
+                    continue
+
                 target = env.target_fixture
                 goal = np.array(env.target_pos)
                 goal_ori = np.array(env.target_ori)
